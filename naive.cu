@@ -7,7 +7,6 @@ using namespace std;
 
 
 
-#define blockSize 256
 
 
 __global__ void naiveMatMul(float* A, float* B, float* C, int N, int K, int M) {
