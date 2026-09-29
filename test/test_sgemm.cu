@@ -7,6 +7,10 @@
 //           ./build/test_sgemm --quick      # correctness suite only, no big perf run
 //           ./build/test_sgemm --sweep      # perf at several shapes + summary table
 //
+// Tensor-core kernels (TF32 / FP16 inputs) are held to a looser tolerance and
+// are also compared against cuBLAS at the same input precision -- the
+// like-for-like baseline -- as well as against FP32 cuBLAS.
+//
 // The kernel files each have their own main() and matMul(). Rather than
 // edit them, they are #included here with those two symbols renamed away, so
 // each file still compiles and runs standalone exactly as before.
@@ -20,6 +24,7 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 
 // ---------------------------------------------------------------- kernel import
 #define main   naive_main_
@@ -110,6 +115,19 @@ static constexpr int WT_BM = BM;
 #undef PASSES_A
 #undef PASSES_B
 
+// tensor-core GEMM (FP16 inputs, FP32 accumulate, WMMA), kernel tcgemm
+#include "../tensor_core/tc_gemm.cu"
+static constexpr int TC_BM_ = BM;
+#undef BM
+#undef BK
+#undef TN
+#undef NTHREADS
+#undef PAD
+#undef STRIDE_A
+#undef STRIDE_B
+#undef PASSES_A
+#undef PASSES_B
+
 // ---------------------------------------------------------------------- helpers
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
@@ -127,7 +145,12 @@ static constexpr int WT_BM = BM;
 // a wrong answer, which the comparison below still catches.
 static const size_t PAD_ELEMS = 1 << 16;
 
-static const double REL_TOL = 1e-3;   // relative error accepted vs the reference
+static const double REL_TOL  = 1e-3;  // relative error accepted vs the reference
+static const double LOWP_TOL = 1e-2;  // TF32/FP16 inputs keep 10 mantissa bits: ~1e-4..1e-3 error expected
+
+// input precision of a kernel, and which cuBLAS it is compared against
+enum Prec { P_FP32 = 0, P_TF32 = 1, P_FP16 = 2, NUM_PREC = 3 };
+static const char* PREC_NAME[NUM_PREC] = { "FP32", "TF32", "FP16" };
 
 struct Diff {
     double maxAbs = 0.0;
@@ -212,30 +235,50 @@ static void launchWarpTile(const float* dA, const float* dB, float* dC, int N, i
     warpTile<<<grid, block>>>((float*)dA, (float*)dB, dC, N, K, M);
 }
 
+// FP16 tensor cores (WMMA): 256 threads = 8 warps, each a 64x32 warp tile of
+// 16x16 fragments. The epilogue stores whole fragments with no bounds check, so
+// the rows and cols of C must be multiples of the 128 block tile.
+static void launchTcGemm(const float* dA, const float* dB, float* dC, int N, int K, int M) {
+    dim3 block(256);
+    dim3 grid((M + TC_BM_ - 1) / TC_BM_, (N + TC_BM_ - 1) / TC_BM_);
+    tcgemm<<<grid, block>>>((float*)dA, (float*)dB, dC, N, K, M);
+}
+
 struct Kernel {
     const char* name;
     LaunchFn    launch;
-    int         align;   // K and M must be multiples of this (float4 kernels need 4)
+    int         align;      // K and M must be multiples of this (float4 kernels need 4)
+    int         tileAlign;  // N and M (rows and cols of C) must be multiples of this
+    int         prec;       // Prec: input precision; non-FP32 gets LOWP_TOL and a matching cuBLAS
 };
 
 static Kernel g_kernels[] = {
-    { "naive",          launchNaive,              1 },
-    { "sharedmem",      launchSharedMem,          1 },
-    { "threadtile",     launchThreadTile,         1 },
-    { "sharedthread",   launchSharedThreadTile,   1 },
-    { "sharedthreadv2", launchSharedThreadTileV2, 1 },
-    { "transpose",      launchTranspose,          4 },
-    { "doublebuffer",   launchDoubleBuffer,       4 },
-    { "bk16",           launchBk16,               4 },
-    { "warptile",       launchWarpTile,           4 },
+    { "naive",          launchNaive,              1,   1, P_FP32 },
+    { "sharedmem",      launchSharedMem,          1,   1, P_FP32 },
+    { "threadtile",     launchThreadTile,         1,   1, P_FP32 },
+    { "sharedthread",   launchSharedThreadTile,   1,   1, P_FP32 },
+    { "sharedthreadv2", launchSharedThreadTileV2, 1,   1, P_FP32 },
+    { "transpose",      launchTranspose,          4,   1, P_FP32 },
+    { "doublebuffer",   launchDoubleBuffer,       4,   1, P_FP32 },
+    { "bk16",           launchBk16,               4,   1, P_FP32 },
+    { "warptile",       launchWarpTile,           4,   1, P_FP32 },
+    { "tc_gemm (fp16)", launchTcGemm,             4, 128, P_FP16 },
 };
 
 // A misaligned float4 access is a sticky device error that would poison every
 // later test, so shapes that violate a kernel's alignment precondition are
 // skipped and reported rather than run.
-static bool shapeOk(const Kernel& k, int K, int M) {
-    return (K % k.align == 0) && (M % k.align == 0);
+static bool shapeOk(const Kernel& k, int N, int K, int M) {
+    return (K % k.align == 0) && (M % k.align == 0) &&
+           (N % k.tileAlign == 0) && (M % k.tileAlign == 0);
 }
+static const char* skipReason(const Kernel& k, int N, int K, int M, char* buf, size_t len) {
+    if (K % k.align || M % k.align) snprintf(buf, len, "skip (K,M %% %d)", k.align);
+    else                            snprintf(buf, len, "skip (N,M %% %d)", k.tileAlign);
+    (void)N;
+    return buf;
+}
+static double tolFor(const Kernel& k) { return k.prec != P_FP32 ? LOWP_TOL : REL_TOL; }
 static const int NUM_KERNELS = (int)(sizeof(g_kernels) / sizeof(g_kernels[0]));
 
 // ------------------------------------------------------------------- references
@@ -246,6 +289,17 @@ static void cublasReference(cublasHandle_t h, const float* dA, const float* dB,
     const float alpha = 1.0f, beta = 0.0f;
     cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
                 &alpha, dB, M, dA, K, &beta, dC, M);
+}
+
+// cuBLAS handles, created in main(): g_fp32 in default math (true FP32 SGEMM),
+// g_tf32 in TF32 tensor-op mode. The FP16 baseline is cublasGemmEx on FP16
+// copies of A and B (made once per fixture, not timed) with FP32 accumulate.
+static cublasHandle_t g_fp32 = nullptr;
+static cublasHandle_t g_tf32 = nullptr;
+
+__global__ void floatToHalfKernel(const float* in, __half* out, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half_rn(in[i]);
 }
 
 static void cpuReference(const float* A, const float* B, float* C, int N, int K, int M) {
@@ -261,6 +315,7 @@ static void cpuReference(const float* A, const float* B, float* C, int N, int K,
 struct Fixture {
     int N, K, M;
     float *dA = nullptr, *dB = nullptr, *dC = nullptr, *dRef = nullptr;
+    __half *dAh = nullptr, *dBh = nullptr;     // FP16 copies, for the cuBLAS FP16 baseline
     std::vector<float> hA, hB, ref;
 
     void setup(int n, int k, int m, cublasHandle_t h) {
@@ -284,15 +339,30 @@ struct Fixture {
         CUDA_CHECK(cudaMemcpy(dB, hB.data(), hB.size() * sizeof(float), cudaMemcpyHostToDevice));
 
         cublasReference(h, dA, dB, dRef, N, K, M);
+        CUDA_CHECK(cudaMalloc(&dAh, hA.size() * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&dBh, hB.size() * sizeof(__half)));
+        floatToHalfKernel<<<(unsigned)((hA.size() + 255) / 256), 256>>>(dA, dAh, hA.size());
+        floatToHalfKernel<<<(unsigned)((hB.size() + 255) / 256), 256>>>(dB, dBh, hB.size());
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(ref.data(), dRef, ref.size() * sizeof(float), cudaMemcpyDeviceToHost));
     }
 
     void teardown() {
-        cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dRef);
-        dA = dB = dC = dRef = nullptr;
+        cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dRef); cudaFree(dAh); cudaFree(dBh);
+        dA = dB = dC = dRef = nullptr; dAh = dBh = nullptr;
     }
 };
+
+// cuBLAS at a given input precision, into fx.dC
+static void cublasRun(int prec, Fixture& fx) {
+    const float one = 1.0f, zero = 0.0f;
+    if (prec == P_FP32) cublasReference(g_fp32, fx.dA, fx.dB, fx.dC, fx.N, fx.K, fx.M);
+    else if (prec == P_TF32) cublasReference(g_tf32, fx.dA, fx.dB, fx.dC, fx.N, fx.K, fx.M);
+    else  // FP16 in, FP32 accumulate and out; same column-major trick as cublasReference
+        cublasGemmEx(g_fp32, CUBLAS_OP_N, CUBLAS_OP_N, fx.M, fx.N, fx.K, &one,
+                     fx.dBh, CUDA_R_16F, fx.M, fx.dAh, CUDA_R_16F, fx.K, &zero,
+                     fx.dC, CUDA_R_32F, fx.M, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
 
 // Runs one kernel and returns its output. err is set if the launch failed.
 static bool runKernel(const Kernel& kern, Fixture& fx, std::vector<float>& out,
@@ -367,6 +437,24 @@ static bool selfTestReference(cublasHandle_t h) {
     return d.maxRel <= REL_TOL;
 }
 
+// Confirms the low-precision baselines really run at low precision: TF32/FP16
+// rounding makes them differ from FP32 by far more than FP32 rounding does
+// (~1e-7). A ~0 difference would mean the "TF32" baseline was secretly FP32.
+static void selfTestLowPrec(cublasHandle_t h) {
+    Fixture fx;
+    fx.setup(512, 512, 512, h);
+    std::vector<float> out(fx.ref.size());
+    for (int p = P_TF32; p < NUM_PREC; ++p) {
+        cublasRun(p, fx);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(out.data(), fx.dC, out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        Diff d = compareResults(out, fx.ref);
+        printf("  cuBLAS %s vs cuBLAS FP32:      max rel %.2e  %s\n", PREC_NAME[p], d.maxRel,
+               d.maxRel > 1e-6 ? "(low precision active)" : "(no difference: NOT running at low precision)");
+    }
+    fx.teardown();
+}
+
 static int correctnessSuite(cublasHandle_t h) {
     struct Shape { int N, K, M; const char* note; };
     const Shape shapes[] = {
@@ -377,11 +465,13 @@ static int correctnessSuite(cublasHandle_t h) {
         { 129, 129, 129, "not a multiple of 16 or 64"   },
         { 200, 300, 400, "rectangular, K != N != M"     },
         {  48,  80,  96, "smaller than a 64 tile"       },
+        { 256, 100, 384, "K not a multiple of 16"       },
         {1024,1024,1024, "square"                       },
     };
     const int nShapes = (int)(sizeof(shapes) / sizeof(shapes[0]));
 
-    printf("\n=== correctness (vs cuBLAS, relative tolerance %.0e) ===\n\n", REL_TOL);
+    printf("\n=== correctness (vs cuBLAS FP32, relative tolerance %.0e; TF32/FP16 kernels %.0e, error shown) ===\n\n",
+           REL_TOL, LOWP_TOL);
     printf("%-22s", "shape  N x K x M");
     for (int k = 0; k < NUM_KERNELS; ++k) printf("%17s", g_kernels[k].name);
     printf("\n");
@@ -401,9 +491,8 @@ static int correctnessSuite(cublasHandle_t h) {
         for (int k = 0; k < NUM_KERNELS; ++k) {
             const char* err = nullptr;
             char cell[32];
-            if (!shapeOk(g_kernels[k], fx.K, fx.M)) {
-                snprintf(cell, sizeof(cell), "skip (K,M %% %d)", g_kernels[k].align);
-                printf("%17s", cell);
+            if (!shapeOk(g_kernels[k], fx.N, fx.K, fx.M)) {
+                printf("%17s", skipReason(g_kernels[k], fx.N, fx.K, fx.M, cell, sizeof(cell)));
                 continue;
             }
             if (!runKernel(g_kernels[k], fx, out, &err)) {
@@ -414,8 +503,10 @@ static int correctnessSuite(cublasHandle_t h) {
                 continue;
             }
             Diff d = compareResults(out, fx.ref);
-            if (!d.finite)                    { snprintf(cell, sizeof(cell), "NaN/Inf"); failures++; }
-            else if (d.maxRel <= REL_TOL)     { snprintf(cell, sizeof(cell), "ok"); }
+            const double tol = tolFor(g_kernels[k]);
+            if (!d.finite)              { snprintf(cell, sizeof(cell), "NaN/Inf"); failures++; }
+            else if (d.maxRel <= tol)   { if (g_kernels[k].prec != P_FP32) snprintf(cell, sizeof(cell), "ok %.1e", d.maxRel);
+                                          else                   snprintf(cell, sizeof(cell), "ok"); }
             else { snprintf(cell, sizeof(cell), "FAIL %.1e", d.maxRel); failures++; }
             printf("%17s", cell);
         }
@@ -440,12 +531,13 @@ static const float SETTLE_MS = 2500.0f;   // sustained load before timing
 // clock transition, which is what blew the spreads up at 2048^3.
 static const float TARGET_SAMPLE_MS = 20.0f;
 
-static float launchAndTime(const Kernel* kern, cublasHandle_t h, Fixture& fx,
+// kern == nullptr times cuBLAS at input precision `prec`
+static float launchAndTime(const Kernel* kern, int prec, Fixture& fx,
                            cudaEvent_t e0, cudaEvent_t e1, int iters = 1) {
     CUDA_CHECK(cudaEventRecord(e0));
     for (int i = 0; i < iters; ++i) {
         if (kern) kern->launch(fx.dA, fx.dB, fx.dC, fx.N, fx.K, fx.M);
-        else      cublasReference(h, fx.dA, fx.dB, fx.dC, fx.N, fx.K, fx.M);
+        else      cublasRun(prec, fx);
     }
     CUDA_CHECK(cudaEventRecord(e1));
     if (cudaEventSynchronize(e1) != cudaSuccess) return -1.0f;
@@ -459,7 +551,13 @@ static int itersFor(float warmMs) {
     return it < 1 ? 1 : (it > 200 ? 200 : it);
 }
 
-static std::vector<double> perfSuite(cublasHandle_t h, int N, int K, int M) {
+struct PerfResult {
+    std::vector<double> pct;        // % of cuBLAS FP32, per kernel (-1 = not run)
+    std::vector<double> pctMatch;   // % of cuBLAS at the kernel's own precision (low-precision kernels only)
+    double refPct[NUM_PREC] = {100.0, -1, -1};   // each cuBLAS precision as % of cuBLAS FP32
+};
+
+static PerfResult perfSuite(cublasHandle_t h, int N, int K, int M) {
     printf("\n=== performance  (N=%d  K=%d  M=%d;  median of %d interleaved rounds, ~%.0f ms per sample) ===\n\n",
            N, K, M, PERF_ROUNDS, TARGET_SAMPLE_MS);
     Fixture fx;
@@ -471,7 +569,7 @@ static std::vector<double> perfSuite(cublasHandle_t h, int N, int K, int M) {
     std::vector<bool> eligible(NUM_KERNELS, false);
     std::vector<float> out;
     for (int k = 0; k < NUM_KERNELS; ++k) {
-        if (!shapeOk(g_kernels[k], fx.K, fx.M)) continue;
+        if (!shapeOk(g_kernels[k], fx.N, fx.K, fx.M)) continue;
         const char* err = nullptr;
         if (!runKernel(g_kernels[k], fx, out, &err)) {
             verdict[k] = "LAUNCH ERR";
@@ -479,7 +577,7 @@ static std::vector<double> perfSuite(cublasHandle_t h, int N, int K, int M) {
             continue;
         }
         Diff d = compareResults(out, fx.ref);
-        verdict[k] = (!d.finite) ? "NaN/Inf" : (d.maxRel <= REL_TOL ? "ok" : "FAIL");
+        verdict[k] = (!d.finite) ? "NaN/Inf" : (d.maxRel <= tolFor(g_kernels[k]) ? "ok" : "FAIL");
         eligible[k] = true;
     }
 
@@ -487,11 +585,14 @@ static std::vector<double> perfSuite(cublasHandle_t h, int N, int K, int M) {
     CUDA_CHECK(cudaEventCreate(&e0));
     CUDA_CHECK(cudaEventCreate(&e1));
 
-    // warm-up pass: one launch each; its time sets the batch size per kernel
-    std::vector<int> iters(NUM_KERNELS + 1, 1);
+    // warm-up pass: one launch each; its time sets the batch size per kernel.
+    // slots NUM_KERNELS + p are cuBLAS at precision p (FP32, TF32, FP16).
+    const int CUB = NUM_KERNELS;
+    std::vector<int> iters(NUM_KERNELS + NUM_PREC, 1);
     for (int k = 0; k < NUM_KERNELS; ++k)
-        if (eligible[k]) iters[k] = itersFor(launchAndTime(&g_kernels[k], h, fx, e0, e1));
-    iters[NUM_KERNELS] = itersFor(launchAndTime(nullptr, h, fx, e0, e1));
+        if (eligible[k]) iters[k] = itersFor(launchAndTime(&g_kernels[k], P_FP32, fx, e0, e1));
+    for (int p = 0; p < NUM_PREC; ++p)
+        iters[CUB + p] = itersFor(launchAndTime(nullptr, p, fx, e0, e1));
 
     // clock-settle: on a power/thermally limited GPU the clock ramps up at the
     // start of a run and is pulled back down over the next second or two. Keep
@@ -501,22 +602,23 @@ static std::vector<double> perfSuite(cublasHandle_t h, int N, int K, int M) {
     {
         float settled = 0.0f;
         while (settled < SETTLE_MS) {
-            float ms = launchAndTime(nullptr, h, fx, e0, e1);
+            float ms = launchAndTime(nullptr, P_FP32, fx, e0, e1);
             if (ms < 0) break;
             settled += ms;
         }
     }
 
     // interleaved timed rounds
-    std::vector<std::vector<float>> samples(NUM_KERNELS + 1);
+    std::vector<std::vector<float>> samples(NUM_KERNELS + NUM_PREC);
     for (int r = 0; r < PERF_ROUNDS; ++r) {
         for (int k = 0; k < NUM_KERNELS; ++k) {
             if (!eligible[k]) continue;
-            float ms = launchAndTime(&g_kernels[k], h, fx, e0, e1, iters[k]);
+            float ms = launchAndTime(&g_kernels[k], P_FP32, fx, e0, e1, iters[k]);
             if (ms < 0) { eligible[k] = false; verdict[k] = "LAUNCH ERR"; continue; }
             samples[k].push_back(ms);
         }
-        samples[NUM_KERNELS].push_back(launchAndTime(nullptr, h, fx, e0, e1, iters[NUM_KERNELS]));
+        for (int p = 0; p < NUM_PREC; ++p)
+            samples[CUB + p].push_back(launchAndTime(nullptr, p, fx, e0, e1, iters[CUB + p]));
     }
     CUDA_CHECK(cudaEventDestroy(e0));
     CUDA_CHECK(cudaEventDestroy(e1));
@@ -532,33 +634,51 @@ static std::vector<double> perfSuite(cublasHandle_t h, int N, int K, int M) {
         return 100.0f * (hi - lo) / c[c.size() / 2];
     };
 
-    float msCublas = median(samples[NUM_KERNELS]);
-    double gfCublas = flop / (msCublas / 1e3) / 1e9;
+    double gfRef[NUM_PREC];
+    for (int p = 0; p < NUM_PREC; ++p) gfRef[p] = flop / (median(samples[CUB + p]) / 1e3) / 1e9;
+    const double gfCublas = gfRef[P_FP32];
 
-    printf("%-22s %12s %14s %12s %9s %10s\n",
-           "kernel", "time (ms)", "GFLOP/s", "% of cuBLAS", "spread", "correct");
-    printf("%-22s %12s %14s %12s %9s %10s\n",
-           "----------------------", "------------", "--------------", "------------", "---------", "----------");
+    printf("%-22s %12s %14s %12s %12s %9s %10s\n",
+           "kernel", "time (ms)", "GFLOP/s", "% of cuBLAS", "% same-prec", "spread", "correct");
+    printf("%-22s %12s %14s %12s %12s %9s %10s\n",
+           "----------------------", "------------", "--------------", "------------", "------------",
+           "---------", "----------");
     for (int k = 0; k < NUM_KERNELS; ++k) {
         if (!eligible[k]) {
-            printf("%-22s %12s %14s %12s %9s %10s\n", g_kernels[k].name, "-", "-", "-", "-", verdict[k]);
+            printf("%-22s %12s %14s %12s %12s %9s %10s\n", g_kernels[k].name, "-", "-", "-", "-", "-", verdict[k]);
             continue;
         }
         float ms = median(samples[k]);
         double gf = flop / (ms / 1e3) / 1e9;
-        printf("%-22s %12.3f %14.2f %11.1f%% %8.1f%% %10s\n",
-               g_kernels[k].name, ms, gf, 100.0 * gf / gfCublas, spread(samples[k]), verdict[k]);
+        char tf[16] = "-";
+        if (g_kernels[k].prec != P_FP32) snprintf(tf, sizeof(tf), "%.1f%%", 100.0 * gf / gfRef[g_kernels[k].prec]);
+        printf("%-22s %12.3f %14.2f %11.1f%% %12s %8.1f%% %10s\n",
+               g_kernels[k].name, ms, gf, 100.0 * gf / gfCublas, tf, spread(samples[k]), verdict[k]);
     }
-    printf("%-22s %12.3f %14.2f %11.1f%% %8.1f%% %10s\n",
-           "cuBLAS SGEMM", msCublas, gfCublas, 100.0, spread(samples[NUM_KERNELS]), "ref");
+    for (int p = 0; p < NUM_PREC; ++p) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "cuBLAS %s", p == P_FP32 ? "SGEMM (FP32)" : PREC_NAME[p]);
+        printf("%-22s %12.3f %14.2f %11.1f%% %12s %8.1f%% %10s\n",
+               nm, median(samples[CUB + p]), gfRef[p], 100.0 * gfRef[p] / gfCublas,
+               p == P_FP32 ? "-" : "100.0%", spread(samples[CUB + p]), "ref");
+    }
     printf("\n  spread = (max - min) / median across rounds. Large spreads mean the clock\n"
-           "  was moving; differences between kernels smaller than the spread are noise.\n");
+           "  was moving; differences between kernels smaller than the spread are noise.\n"
+           "  %% same-prec = vs cuBLAS at the kernel's own input precision (TF32 or FP16\n"
+           "  inputs, FP32 accumulate) -- the like-for-like baseline for tensor-core kernels.\n");
 
-    std::vector<double> pct(NUM_KERNELS, -1.0);
-    for (int k = 0; k < NUM_KERNELS; ++k)
-        if (eligible[k]) pct[k] = 100.0 * (flop / (median(samples[k]) / 1e3) / 1e9) / gfCublas;
+    PerfResult res;
+    res.pct.assign(NUM_KERNELS, -1.0);
+    res.pctMatch.assign(NUM_KERNELS, -1.0);
+    for (int k = 0; k < NUM_KERNELS; ++k) {
+        if (!eligible[k]) continue;
+        const double gf = flop / (median(samples[k]) / 1e3) / 1e9;
+        res.pct[k] = 100.0 * gf / gfCublas;
+        if (g_kernels[k].prec != P_FP32) res.pctMatch[k] = 100.0 * gf / gfRef[g_kernels[k].prec];
+    }
+    for (int p = 0; p < NUM_PREC; ++p) res.refPct[p] = 100.0 * gfRef[p] / gfCublas;
     fx.teardown();
-    return pct;
+    return res;
 }
 
 // ---------------------------------------------------------------- shape sweep
@@ -575,7 +695,7 @@ static const SweepShape g_sweep[] = {
 static const int NUM_SWEEP = (int)(sizeof(g_sweep) / sizeof(g_sweep[0]));
 
 static void sweepSuite(cublasHandle_t h) {
-    std::vector<std::vector<double>> table;
+    std::vector<PerfResult> table;
     for (int i = 0; i < NUM_SWEEP; ++i)
         table.push_back(perfSuite(h, g_sweep[i].N, g_sweep[i].K, g_sweep[i].M));
 
@@ -592,8 +712,25 @@ static void sweepSuite(cublasHandle_t h) {
     for (int k = 0; k < NUM_KERNELS; ++k) {
         printf("%-16s", g_kernels[k].name);
         for (int i = 0; i < NUM_SWEEP; ++i) {
-            if (table[i][k] < 0) printf("%16s", "skip");
-            else                 printf("%15.1f%%", table[i][k]);
+            if (table[i].pct[k] < 0) printf("%16s", "skip");
+            else                     printf("%15.1f%%", table[i].pct[k]);
+        }
+        printf("\n");
+    }
+    for (int p = P_TF32; p < NUM_PREC; ++p) {
+        char nm[32]; snprintf(nm, sizeof(nm), "cuBLAS %s", PREC_NAME[p]);
+        printf("%-16s", nm);
+        for (int i = 0; i < NUM_SWEEP; ++i) printf("%15.1f%%", table[i].refPct[p]);
+        printf("\n");
+    }
+
+    printf("\n  tensor-core kernels as %% of cuBLAS at the same input precision:\n\n");
+    for (int k = 0; k < NUM_KERNELS; ++k) {
+        if (g_kernels[k].prec == P_FP32) continue;
+        printf("%-16s", g_kernels[k].name);
+        for (int i = 0; i < NUM_SWEEP; ++i) {
+            if (table[i].pctMatch[k] < 0) printf("%16s", "skip");
+            else                          printf("%15.1f%%", table[i].pctMatch[k]);
         }
         printf("\n");
     }
@@ -625,20 +762,24 @@ int main(int argc, char** argv) {
 
     cublasHandle_t h;
     cublasCreate(&h);
+    g_fp32 = h;
+    cublasCreate(&g_tf32);
+    cublasSetMathMode(g_tf32, CUBLAS_TF32_TENSOR_OP_MATH);
 
     printf("\n=== harness self-test ===\n\n");
     bool cmpOk = selfTestComparator();
     printf("  comparator detects corruption:    %s\n", cmpOk ? "ok" : "BROKEN");
     bool refOk = selfTestReference(h);
+    selfTestLowPrec(h);
     if (!cmpOk || !refOk) {
         fprintf(stderr, "\nHarness self-test failed; kernel results below cannot be trusted.\n");
-        cublasDestroy(h);
+        cublasDestroy(h); cublasDestroy(g_tf32);
         return 2;
     }
 
     if (sweep) {
         sweepSuite(h);
-        cublasDestroy(h);
+        cublasDestroy(h); cublasDestroy(g_tf32);
         return 0;
     }
 
@@ -647,6 +788,6 @@ int main(int argc, char** argv) {
 
     printf("\n%s\n", failures == 0 ? "All correctness cases passed."
                                    : "Some correctness cases failed (see table).");
-    cublasDestroy(h);
+    cublasDestroy(h); cublasDestroy(g_tf32);
     return failures == 0 ? 0 : 1;
 }

@@ -1,7 +1,9 @@
 # From SGEMM to fused attention: CUDA kernels from scratch
 
-Two parts, one codebase, on a laptop RTX 5070 (Blackwell, sm_120), fp32 on CUDA
-cores — no libraries in the kernels, no tensor cores, no inline PTX.
+Three parts, one codebase, on a laptop RTX 5070 (Blackwell, sm_120). Parts 1 and
+2 are FP32 on CUDA cores; part 3 moves both kernels onto FP16 tensor cores. No
+libraries inside the kernels and no inline PTX in them (the peak-throughput
+microbenchmark in part 3 is the one place that uses PTX `mma`).
 
 1. **SGEMM** — single-precision matrix multiply `C = A·B`, written one
    optimisation at a time and measured against cuBLAS at every step. The final
@@ -13,6 +15,12 @@ cores — no libraries in the kernels, no tensor cores, no inline PTX.
    kernel is **1.7–2.5× faster than an unfused cuBLAS pipeline for N ≥ 4096**,
    uses **no workspace**, and runs at **N = 65,536, where the unfused version
    needs 16 GB** for the score matrix.
+3. **Tensor cores** — both kernels rewritten with FP16 WMMA fragments. The GEMM
+   reaches **79–89% of cuBLAS FP16** (2.6× the FP32 ladder's best kernel); the
+   fused attention kernel is **1.6–1.9× faster than its FP32 version** at an
+   error of 4e-4. A peak-throughput microbenchmark explains the choice of
+   format: on this GPU, **TF32 tensor cores are no faster than FP32 CUDA
+   cores** (25 TFLOP/s each) — FP16 is the first format that doubles it.
 
 The interesting parts are not the final numbers. They are the optimisations that
 *didn't* work as predicted and why, the races and indexing bugs the test harnesses
@@ -72,7 +80,14 @@ per head).*
 - [What the attention work taught](#what-the-attention-work-taught)
 - [Correctness (attention)](#correctness-attention)
 
-**Both**
+**Part 3 — Tensor cores**
+- [Why FP16: peak throughput per format](#why-fp16-peak-throughput-per-format)
+- [What changes in a tensor-core kernel](#what-changes-in-a-tensor-core-kernel)
+- [tc_gemm: FP16 GEMM](#tc_gemm-fp16-gemm)
+- [tc_attn: FP16 fused attention](#tc_attn-fp16-fused-attention)
+- [Correctness (tensor cores)](#correctness-tensor-cores)
+
+**All parts**
 - [Measuring on a laptop](#measuring-on-a-laptop)
 - [Build and run](#build-and-run)
 - [Files](#files)
@@ -453,6 +468,182 @@ the next row.
 
 ---
 
+# Part 3 — Tensor cores
+
+Both kernels, rewritten so the multiply-adds run on tensor cores through the
+WMMA API (`nvcuda::wmma`): FP16 inputs, FP32 accumulation, inputs and outputs
+still `float*` so the same harnesses and references apply.
+
+## Why FP16: peak throughput per format
+
+Which format to use was decided by measurement. `tensor_core/mma_peak.cu` issues
+back-to-back multiply-adds with no memory traffic and enough independent
+accumulators to hide latency — the ceiling any kernel could reach, per format:
+
+| path | peak (range over runs) | vs FP32 |
+|---|---|---|
+| FP32 FFMA on CUDA cores (the Part 1 ladder) | 25.3–25.4 TFLOP/s | 1× |
+| TF32 tensor cores (`wmma` 16×16×8, or `mma.sync` m16n8k8) | 24.1–25.2 | **1×** |
+| FP16 in, FP32 accumulate (`mma.sync` m16n8k16) | 48.6–50.4 | 2× |
+| FP8 e4m3 in, FP32 accumulate (`mma.sync` m16n8k32) | 95–101 | ~4× |
+
+On this GeForce part, **TF32 tensor cores and plain FP32 cores have the same
+ceiling**, so a TF32 kernel can at best match a good FP32 one; FP16 is the first
+format that doubles it. (cuBLAS TF32 still beats cuBLAS FP32, 146%, because the
+tensor path is easier to keep near its ceiling — not because the ceiling is
+higher.) FP8 doubles it again but was not used: 3 mantissa bits means ~3% error
+per input, it needs per-tensor or per-block scale factors to be usable, and
+WMMA doesn't support it — it needs `mma.sync` with explicit register layouts.
+
+## What changes in a tensor-core kernel
+
+![A thread vs a warp as the unit of work](docs/tc_fig1.svg)
+
+On CUDA cores each thread issues its own FFMAs on values it can index. A tensor
+core is driven by the **whole warp**: all 32 lanes call `mma_sync` together and
+the hardware computes a whole tile product in one call — 16×16×16 = 4,096
+multiply-adds for FP16, against 32 for one FFMA instruction across a warp (the
+figure shows the TF32 shape, 16×16×8). Operands and results live in
+**fragments**: register tiles spread across the 32 lanes in a layout WMMA does
+not specify. You can load, store, `mma`, or apply one operation to every
+element — but you cannot ask for element (r, c), so anything per row (a row max,
+scaling row r by `alpha[r]`) has to go through shared memory.
+
+Everything else — block tiling, coalesced float4 global loads, shared tiles,
+barriers, double buffering, occupancy — carries over unchanged. The warp's job
+is literally the same: in the GEMM each warp still owns a 64×32 block of C;
+only the split inside the warp changes, from 32 lanes × 8×8 to 8 fragments of
+16×16, and 512 FFMA instructions per k-step become 8 `mma_sync`.
+
+![One warp's work in the GEMM, before and after](docs/tc_fig5.svg)
+
+## tc_gemm: FP16 GEMM
+
+`tensor_core/tc_gemm.cu` keeps rung 8's structure (128×128 block tile, 256
+threads as 2×4 warps of 64×32, double-buffered shared memory, register-staged
+prefetch) and replaces the per-thread 8×8 outer product with fragments:
+
+- **Conversion on the way in:** the float4 global loads are converted to `half2`
+  immediately, and shared memory holds `half` — half the bytes per tile.
+- **BK = 32:** one FP16 `mma` is 16 deep, so BK = 16 would leave one step per
+  slab. Two steps per barrier; the halved element size keeps both buffers at
+  37 KB.
+- **Padding 8, not 4:** for `half` fragments `ldm` must be a multiple of 8
+  elements; tile starts must be 32-byte aligned.
+- **`__launch_bounds__(256, 2)`:** see below.
+
+![The inner loop for one slab, seen from one warp](docs/tc_fig6.svg)
+
+```
+4096³                  time (ms)     TFLOP/s   % cuBLAS FP32   % cuBLAS FP16
+warptile (FP32)           13.376       10.28           85.0%               -
+tc_gemm (FP16)             5.033       27.31          225.8%           81.3%
+cuBLAS FP32               11.364       12.09          100.0%               -
+cuBLAS TF32                7.765       17.70          146.3%               -
+cuBLAS FP16                4.090       33.60          277.8%          100.0%
+```
+
+Across the sweep shapes, as % of cuBLAS FP16: **79.1% (4096³), 85.4% (2048³),
+86.5% (1024×4096×1024), 89.1% (8192×512×8192)**; 4000³ is skipped, because the
+epilogue stores whole 16×16 fragments and needs rows and columns that are
+multiples of 128. The comparison slightly favours cuBLAS: `tc_gemm` reads FP32
+from global memory and converts on the fly, while the cuBLAS FP16 baseline
+reads pre-converted FP16 — half the bytes.
+
+**The first version was TF32, and it was slower than the FP32 ladder.** At 39%
+of cuBLAS TF32 and 1.5× slower than `warptile`, it was taken apart by switching
+pieces off (4096³, idle GPU):
+
+| variant | time | % of the 25 TFLOP/s ceiling |
+|---|---|---|
+| full TF32 kernel | 14.6 ms | 37% |
+| without global loads | 13.2 ms | 42% |
+| **only the `mma`s** — no loads at all, 32 HMMA + a barrier per slab | **12.4 ms** | **44%** |
+| only the memory side — no `mma` | 5.3 ms | — |
+| cuBLAS TF32 | 6.3 ms | 87% |
+
+Not memory: with every load removed the tensor pipe still ran at 44% — 16 warps
+per SM, and only 32 tensor instructions between barriers, is not enough work in
+flight for its latency. And the ceiling was the same as FP32's anyway. FP16
+fixed both: twice the ceiling, and twice the math per barrier with BK = 32.
+
+**One register over the line.** The FP16 version first compiled to 129
+registers — which rounds up to 136 per thread, so only one 256-thread block fit
+per SM instead of two. `__launch_bounds__(256, 2)` tells the compiler the target,
+and it produced 126 registers with 0 spills. The SASS has the same instructions
+(519 vs 520: one extra `MOV`, two fewer `NOP`) in a different order — the
+compiler doesn't model occupancy unless told, so 129 was a side effect of its
+schedule, not a need. (Compare Part 1, where the same bound forced 16 bytes of
+spills and cost 8%.)
+
+## tc_attn: FP16 fused attention
+
+`tensor_core/tc_attn.cu` is `online_attn.cu` with the two products moved onto
+tensor cores. The key observation: in the FP32 kernel, warp `w` already owns
+query rows `w*16 .. +15` — exactly one 16-row fragment strip. So the thread
+mapping, the softmax, the shuffles, `m`, `l` and the masking are **unchanged**;
+only S, P·V and where S and O live change:
+
+- **S = Q·Kᵀ:** 8 `mma_sync` per warp per chunk; stored to a shared `Ss` strip;
+  each lane reads back exactly the 4×4 it used to compute itself.
+- **Kᵀ for free:** K is stored in its natural layout and loaded as a
+  `col_major` fragment, which *is* Kᵀ — no transposed store, and none of its
+  bank conflicts.
+
+  ![col_major is the transpose](docs/tc_fig3.svg)
+
+- **Q once:** each warp's Q rows are loaded into 4 fragments before the chunk
+  loop and stay in registers for the whole kernel.
+- **O in shared:** the `alpha` rescale is per row, which a fragment can't do, so
+  the O accumulator lives in a shared `Os`: rescaled by the softmax lanes, loaded
+  as an accumulator, updated by 8 `mma_sync`, stored back — every chunk.
+- **P as half, over Ss:** P is written as `half` into the memory S came from;
+  the barrier that used to protect the P-over-K alias now protects P-over-S.
+
+![One warp, one chunk: FP32 kernel vs tensor-core kernel](docs/tc_fig7.svg)
+
+```
+     N    online (FP32)    tc-fp16    speedup     tc-fp16 TFLOP/s
+  1024          0.11 ms       0.07       1.6x                4.1
+  2048          0.23          0.13       1.8x                8.0
+  4096          0.71          0.37       1.9x               11.5
+  8192          2.92          1.53       1.9x               11.2
+ 16384         11.48          6.48       1.8x               10.6
+ 32768         43.26         24.37       1.8x               11.3
+ 65536        160.09         93.77       1.7x               11.7
+```
+*batch 1, d = 64, idle GPU; zero workspace at every N; error 3–4e-4 vs the CPU
+FP64 reference (FP32 version: 1e-6).*
+
+**Where it stops:** 11–12 TFLOP/s is about a quarter of the FP16 ceiling. Two
+limits, both from WMMA hiding the fragment layout: S and O make a round trip
+through shared memory every chunk, and the 17 KB FP32 `Os` makes shared memory
+the occupancy limit (45 KB → 8 warps per SM, with 72 registers to spare). The
+`mma.sync` route, with a documented register layout, keeps S and O in registers
+like the FP32 kernel did.
+
+![Dataflow for one warp and one chunk](docs/tc_fig4.svg)
+
+## Correctness (tensor cores)
+
+- **Tolerance by precision.** Each kernel in the harnesses declares its input
+  precision; TF32/FP16 kernels are judged at 1e-2 and their actual error is
+  printed next to "ok", so the looser bound never hides a number. `tc_gemm`
+  measures 6e-5–1.6e-4 against FP32 cuBLAS — the same as cuBLAS FP16 itself
+  (7.6e-5).
+- **Baselines at matching precision, and proven to be.** cuBLAS TF32
+  (`CUBLAS_TF32_TENSOR_OP_MATH`) and cuBLAS FP16 (`cublasGemmEx` on FP16 copies
+  made once, not timed) are self-tested against FP32 cuBLAS: a difference of
+  ~1e-7 would mean the "low-precision" baseline was secretly running FP32.
+- **The staged attention tests apply unchanged.** `make online-tc` runs the same
+  V = 1 / Q = 0 / random stages and tile maps on `tc_attn`: 39 cases including
+  N = 1, 31, 33, 100, 333 and 1000.
+- **Alignment is the new failure mode.** The first FP16 GEMM kept TF32's 4-float
+  padding: `ldm` became 36 halves instead of a multiple of 8, and the result was
+  a sticky `misaligned address` on the first shape it ran.
+
+---
+
 ## Measuring on a laptop
 
 This GPU is power- and thermally-limited: `nvidia-smi` shows SW power capping
@@ -492,6 +683,8 @@ make attn        # attention correctness suite (10 shapes x 3 variants)
 make attn-bench  # attention correctness + sweep over N
 make attn-sweep  # attention sweep only, N = 1024 ... 65536
 make online      # staged debugging harness for the fused kernel
+make online-tc   # the same staged tests on the FP16 tensor-core kernel
+make peak        # peak TFLOP/s per format: FP32, TF32, FP16, FP8
 ```
 
 or directly:
@@ -521,12 +714,16 @@ attention/                  Part 2
   softmax.cu                  row softmax, one block per row, two-level shuffle reductions
   naive_attn.cu               unfused attention: transpose, gemm, softmax, gemm
   online_attn.cu              the fused kernel
+tensor_core/                Part 3
+  tc_gemm.cu                  FP16 WMMA GEMM (FP32 in/out, converted on load)
+  tc_attn.cu                  FP16 WMMA fused attention
+  mma_peak.cu                 peak throughput per number format
 test/                       harnesses; each #includes the kernels it tests
-  test_sgemm.cu               SGEMM correctness + timing, all nine rungs vs cuBLAS
+  test_sgemm.cu               SGEMM correctness + timing, all rungs + tc_gemm vs cuBLAS FP32/TF32/FP16
   test_softmax.cu             softmax unit test
-  test_attn.cu                attention correctness + sweep, all variants
-  test_online.cu              staged debugging harness for the fused kernel
-docs/                       figures: fig1-8 (SGEMM, regenerated by gen_fig.py), attn_fig* (attention)
+  test_attn.cu                attention correctness + sweep, all variants incl. tc-fp16
+  test_online.cu              staged debugging harness for the fused kernels (--tc for FP16)
+docs/                       figures: fig1-8 (SGEMM, regenerated by gen_fig.py), attn_fig* (attention), tc_fig* (tensor cores)
 build/                      binaries, created by make (git-ignored)
 Makefile                    all targets; run from the repo root
 ```
@@ -536,9 +733,10 @@ inner dim, cols of B). The kernels name the same three `(M, K, N)`.
 
 ## What's not here
 
-- **Tensor cores.** Everything is fp32 on CUDA cores. TF32/FP16 `mma` is a
-  different ladder with a different baseline (`cublasGemmEx`), and the natural
-  next project.
+- **`mma.sync` + `ldmatrix`, and `cp.async`.** The tensor-core GEMM uses WMMA,
+  whose fragment loads compile to generic `LD` (not `LDS`) and give no control of
+  the register layout; cuBLAS FP16 is 11–21% ahead across the sweep. The next rung is PTX `mma.sync`
+  fed by `ldmatrix`, with a multi-stage `cp.async` pipeline.
 - **Split-K** for shapes that don't fill the machine (the 64-block column).
 - **A scalar fallback dispatch** for K or N not divisible by 4. The kernel to
   fall back to exists (`sharedthreadtilev2`); the three-line wrapper doesn't.
@@ -561,9 +759,15 @@ For the fused attention kernel, in rough order of value:
 - **Pipelining the K/V loads** — register prefetch, or `cp.async` double
   buffering. `cp.async` can't transpose, so it also means storing K untransposed
   with a strided key-to-lane mapping, and it costs back the third block per SM.
-- **Tensor cores.** TF32 or FP16 `mma` for both products, where the fragment
-  layouts also let P stay in registers. The natural next rung, and the one that
-  would make comparing against FlashAttention-2 meaningful.
+- **`mma.sync` attention.** The FP16 WMMA kernel sends S and O through shared
+  memory every chunk. With `mma.sync`'s documented layouts, S's accumulator
+  becomes P's A-operand in registers and O is rescaled in place — the
+  FlashAttention-2 design, and what would make a comparison with it meaningful.
+- **An FP16 unfused baseline for attention.** `cublas-naive` is FP32, so the
+  tensor-core kernel's lead over it mixes fusion with precision; cuBLAS FP16
+  GEMMs around the same softmax would isolate the fusion gain.
+- **FP8.** Measured at ~4× the FP32 ceiling on this GPU, but it needs
+  `mma.sync` and per-tensor/per-block scaling.
 - **Backward pass**, and split-KV (FlashDecoding) for long-context,
   single-query decoding.
 

@@ -52,6 +52,15 @@
 #include "../attention/online_attn.cu"          // onlineRowKernel: Br x Bc tiled, fused (FA-style)
 #undef main
 
+// tensor-core attention (FP16 WMMA), kernel TcAttn. Its macros (BR, BC, D, ...)
+// have the same values as online_attn.cu's, so the redefinitions are identical
+// and legal. tc_attn.cu uses wmma:: unqualified, so the namespace comes first.
+#include <mma.h>
+using namespace nvcuda;
+#define main tc_attn_main_
+#include "../tensor_core/tc_attn.cu"
+#undef main
+
 // ---------------------------------------------------------------------- helpers
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
@@ -77,7 +86,8 @@ static cublasHandle_t g_cublas;
 // Error is measured as max |got - ref| / max |ref| over the tensor. O is a
 // weighted average of V rows, so individual elements can sit near zero from
 // cancellation; a pure relative metric would flag those unfairly.
-static const double TOL = 1e-3;
+static const double TOL      = 1e-3;
+static const double LOWP_TOL = 1e-2;   // FP16 inputs (10 mantissa bits): ~1e-4..1e-3 expected
 
 struct Diff { double maxAbs = 0, scale = 0, err = 0; bool finite = true; size_t worst = 0; };
 
@@ -223,6 +233,17 @@ static void onlineRun(const float* Q, const float* K, const float* V, float* O,
     }
 }
 
+// FP16 tensor cores: same grid and block as online (one block per BR rows, 4 warps)
+static void tcAttnRun(const float* Q, const float* K, const float* V, float* O,
+                      int batch, int N, int d, float* ws) {
+    (void)ws;
+    const int blocks = (N + BR - 1) / BR;
+    for (int b = 0; b < batch; ++b) {
+        const size_t off = (size_t)b * N * d;
+        TcAttn<<<blocks, 128>>>(Q + off, K + off, V + off, O + off, N);
+    }
+}
+
 // ------------------------------------------------------------------- variants
 typedef size_t (*WorkspaceFn)(int batch, int N, int d);
 typedef void   (*RunFn)(const float* Q, const float* K, const float* V, float* O,
@@ -234,18 +255,21 @@ struct AttnVariant {
     RunFn       run;
     int         alignN;      // N must be a multiple of this (1 = any)
     int         dReq;        // required d (0 = any)
+    bool        lowp;        // FP16/TF32 inputs: judged at LOWP_TOL instead of TOL
 };
 
 static AttnVariant g_variants[] = {
     { "cublas-naive",  cublasNaiveWorkspace, cublasNaiveRun,  1, 0 },   // baseline, row 0
     { "naive",         naiveWorkspace,       naiveRun,       16, 0 },   // your GEMM + your softmax
     { "online",        nullptr,              onlineRun,       1, 64 },   // tiled fused, Br=64 Bc=32, any N
+    { "tc-fp16",       nullptr,              tcAttnRun,       1, 64, true },  // same, FP16 tensor cores
 };
 static const int NUM_VARIANTS = (int)(sizeof(g_variants) / sizeof(g_variants[0]));
 
 static bool shapeOk(const AttnVariant& v, int N, int d) {
     return (N % v.alignN == 0) && (v.dReq == 0 || d == v.dReq);
 }
+static double tolFor(const AttnVariant& v) { return v.lowp ? LOWP_TOL : TOL; }
 static size_t wsBytes(const AttnVariant& v, int batch, int N, int d) {
     return v.workspace ? v.workspace(batch, N, d) : 0;
 }
@@ -353,7 +377,8 @@ static int correctnessSuite() {
     const int nShapes = (int)(sizeof(shapes) / sizeof(shapes[0]));
     const double CPU_BUDGET = 3.0e8;   // batch*N*N*d above this -> GPU reference
 
-    printf("\n=== correctness (max |got-ref| / max |ref|, tolerance %.0e) ===\n\n", TOL);
+    printf("\n=== correctness (max |got-ref| / max |ref|, tolerance %.0e; FP16 variants %.0e) ===\n\n",
+           TOL, LOWP_TOL);
     printf("%-20s %-8s", "batch x N x d", "ref");
     for (int v = 0; v < NUM_VARIANTS; ++v) printf("%16s", g_variants[v].name);
     printf("\n%-20s %-8s", "", "");
@@ -403,7 +428,7 @@ static int correctnessSuite() {
                 CUDA_CHECK(cudaMemcpy(got.data(), fx.dO, fx.n * 4, cudaMemcpyDeviceToHost));
                 Diff df = compareResults(got.data(), ref.data(), fx.n);
                 if (!df.finite)          { snprintf(cell, sizeof(cell), "NaN/Inf"); failures++; }
-                else if (df.err <= TOL)  { snprintf(cell, sizeof(cell), "ok %.0e", df.err); }
+                else if (df.err <= tolFor(g_variants[v])) { snprintf(cell, sizeof(cell), "ok %.0e", df.err); }
                 else { snprintf(cell, sizeof(cell), "FAIL %.1e", df.err); failures++; }
             }
             printf("%16s", cell);
@@ -473,7 +498,7 @@ static std::vector<PerfRow> perfPoint(int batch, int N, int d, bool print) {
         CUDA_CHECK(cudaMemcpy(spotGot.data(), fx.dO, (size_t)spot * d * 4, cudaMemcpyDeviceToHost));
         Diff df = compareResults(spotGot.data(), spotRef.data(), (size_t)spot * d);
         rows[v].err = df.err;
-        rows[v].status = (df.finite && df.err <= TOL) ? "ok" : "FAIL";
+        rows[v].status = (df.finite && df.err <= tolFor(g_variants[v])) ? "ok" : "FAIL";
         eligible[v] = true;
     }
 
@@ -524,7 +549,7 @@ static std::vector<PerfRow> perfPoint(int batch, int N, int d, bool print) {
         CUDA_CHECK(cudaMemcpy(spotGot.data(), fx.dO, (size_t)spot * d * 4, cudaMemcpyDeviceToHost));
         Diff df = compareResults(spotGot.data(), spotRef.data(), (size_t)spot * d);
         rows[v].err = df.err;
-        rows[v].status = (df.finite && df.err <= TOL) ? "ok" : "FAIL";
+        rows[v].status = (df.finite && df.err <= tolFor(g_variants[v])) ? "ok" : "FAIL";
         rows[v].alone = true;
         cudaEvent_t a0, a1; CUDA_CHECK(cudaEventCreate(&a0)); CUDA_CHECK(cudaEventCreate(&a1));
         int it = itersFor(timeVariant(g_variants[v], fx, w, a0, a1, 1));

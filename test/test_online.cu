@@ -4,6 +4,8 @@
 //               ./build/test_online              all stages, all shapes
 //               ./build/test_online --map        print the tile map for every failure, not just the first per stage
 //               ./build/test_online 256          only N = 256 (batch 1), all stages
+//               ./build/test_online --tc         test tensor_core/tc_attn.cu (FP16) instead,
+//                                                at the FP16 tolerance (1e-2)
 //
 // Launch: one block per BR query rows, 128 threads. The kernel only knows one
 // head, so the launcher loops over the batch and offsets the pointers.
@@ -48,6 +50,15 @@
 #include "../attention/online_attn.cu"
 #undef main
 
+// tensor-core attention (FP16 WMMA), kernel TcAttn. Its macros (BR, BC, D, ...)
+// have the same values as online_attn.cu's, so the redefinitions are identical
+// and legal. tc_attn.cu uses wmma:: unqualified, so the namespace comes first.
+#include <mma.h>
+using namespace nvcuda;
+#define main tc_attn_main_
+#include "../tensor_core/tc_attn.cu"
+#undef main
+
 // ---------------------------------------------------------------------- helpers
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
@@ -61,7 +72,13 @@
 
 static const int    THREADS = 128;
 // D (head dim) comes from online_attn.cu
-static const double TOL     = 1e-3;     // max |got - ref| / max |ref|, same metric as test_attn
+static double       TOL     = 1e-3;     // max |got - ref| / max |ref|, same metric as test_attn
+                                        // (--tc raises it to 1e-2 for FP16 inputs)
+
+// which kernel is under test: onlineRowKernel (default) or TcAttn (--tc)
+typedef void (*AttnKernel)(const float*, const float*, const float*, float*, int);
+static AttnKernel g_kernel = onlineRowKernel;
+static const char* g_kernelName = "online_attn";
 static const uint32_t POISON = 0xABABABABu;
 
 static void launchOnline(const float* Q, const float* K, const float* V, float* O,
@@ -69,7 +86,7 @@ static void launchOnline(const float* Q, const float* K, const float* V, float* 
     const int blocks = (N + BR - 1) / BR;
     for (int b = 0; b < batch; ++b) {
         const size_t off = (size_t)b * N * d;
-        onlineRowKernel<<<blocks, THREADS>>>(Q + off, K + off, V + off, O + off, N);
+        g_kernel<<<blocks, THREADS>>>(Q + off, K + off, V + off, O + off, N);
     }
 }
 
@@ -269,16 +286,17 @@ int main(int argc, char** argv) {
     int onlyN = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--map")) mapAlways = true;
+        else if (!strcmp(argv[i], "--tc")) { g_kernel = TcAttn; g_kernelName = "tc_attn (fp16)"; TOL = 1e-2; }
         else onlyN = atoi(argv[i]);
     }
 
     cudaFuncAttributes fa;
-    CUDA_CHECK(cudaFuncGetAttributes(&fa, onlineRowKernel));
+    CUDA_CHECK(cudaFuncGetAttributes(&fa, g_kernel));
     int blocksPerSM = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, onlineRowKernel, THREADS, 0));
-    printf("online_attn: BR=%d BC=%d  %d threads  d=%d   regs/thread %d  static smem %zu B  local (spill) %zu B\n"
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, g_kernel, THREADS, 0));
+    printf("%s: BR=%d BC=%d  %d threads  d=%d   regs/thread %d  static smem %zu B  local (spill) %zu B\n"
            "             occupancy: %d blocks/SM = %d warps/SM\n\n",
-           BR, BC, THREADS, D, fa.numRegs, fa.sharedSizeBytes, fa.localSizeBytes,
+           g_kernelName, BR, BC, THREADS, D, fa.numRegs, fa.sharedSizeBytes, fa.localSizeBytes,
            blocksPerSM, blocksPerSM * THREADS / 32);
 
     struct Shape { int batch, N; };
@@ -302,6 +320,6 @@ int main(int argc, char** argv) {
         stagesPassed += stageOk;
         printf("\n");
     }
-    printf("%d / %d stages pass\n", stagesPassed, (int)NUM_STAGES);
+    printf("%s  (tolerance %.0e): %d / %d stages pass\n", g_kernelName, TOL, stagesPassed, (int)NUM_STAGES);
     return stagesPassed == NUM_STAGES ? 0 : 1;
 }
